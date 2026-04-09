@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/select.h>
@@ -48,7 +49,7 @@ static int find_client(int fd) {
 }
 
 static void remove_client(int idx) {
-    printf("Client %s (fd=%d) ngat ket noi.\n",
+    printf(" Client %s (fd=%d) ngat ket noi.\n",
            clients[idx].addr, clients[idx].fd);
     close(clients[idx].fd);
     clients[idx] = clients[client_count - 1];
@@ -64,6 +65,24 @@ static int add_client(int fd, const char *addr) {
     strncpy(clients[client_count].addr, addr, INET_ADDRSTRLEN - 1);
     client_count++;
     return 0;
+}
+
+static void get_timestamp(char *buf, size_t len) {
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    strftime(buf, len, "%Y/%m/%d %H:%M:%S", t);
+}
+
+static void log_login_success(const char *username, const char *addr) {
+    char ts[32];
+    get_timestamp(ts, sizeof(ts));
+
+    FILE *fp = fopen(CMD_RESULT_FILE, "a");
+    if (!fp) return;
+    fprintf(fp, "[%s] Dang nhap thanh cong: user='%s' tu %s\n", ts, username, addr);
+    fclose(fp);
+
+    printf("[LOG] Ghi out.txt: user='%s' luc %s\n", username, ts);
 }
 
 static int check_credentials(const char *username, const char *password) {
@@ -90,14 +109,13 @@ static int check_credentials(const char *username, const char *password) {
 
 static void execute_command(int fd, const char *cmd) {
     char shell_cmd[BUFFER_SIZE + 64];
-    snprintf(shell_cmd, sizeof(shell_cmd), "%s > %s 2>&1", cmd, CMD_RESULT_FILE);
+    snprintf(shell_cmd, sizeof(shell_cmd), "%s 2>&1", cmd);
 
     printf("[CMD] fd=%d: %s\n", fd, shell_cmd);
-    int ret = system(shell_cmd);
 
-    FILE *fp = fopen(CMD_RESULT_FILE, "r");
+    FILE *fp = popen(shell_cmd, "r");
     if (!fp) {
-        send_str(fd, "[Loi: khong doc duoc ket qua lenh]\r\n$ ");
+        send_str(fd, "[Loi: khong the thuc thi lenh]\r\n$ ");
         return;
     }
 
@@ -113,15 +131,10 @@ static void execute_command(int fd, const char *cmd) {
         send_str(fd, buf);
         sent_any = 1;
     }
-    fclose(fp);
-    remove(CMD_RESULT_FILE);
+    pclose(fp);
 
-    if (!sent_any) {
-        if (ret == 0)
-            send_str(fd, "[Lenh thanh cong, khong co output]\r\n");
-        else
-            send_str(fd, "[Lenh that bai hoac khong co output]\r\n");
-    }
+    if (!sent_any)
+        send_str(fd, "[Lenh thanh cong, khong co output]\r\n");
 
     send_str(fd, "$ ");
 }
@@ -153,14 +166,21 @@ static void handle_client_data(int fd) {
             clients[idx].state          = STATE_LOGGED_IN;
             clients[idx].login_attempts = 0;
 
+            char ts[32];
+            get_timestamp(ts, sizeof(ts));
+            log_login_success(clients[idx].tmp_user, clients[idx].addr);
+
             char welcome[256];
-            snprintf(welcome, sizeof(welcome), "\r\nDang nhap thanh cong: %s.\r\n", clients[idx].tmp_user);
+            snprintf(welcome, sizeof(welcome),
+                     "\r\nDang nhap thanh cong! Chao mung, %s.\r\n"
+                     "Thoi gian dang nhap: %s\r\n",
+                     clients[idx].tmp_user, ts);
             send_str(fd, welcome);
-            printf("Client %s dang nhap: user='%s'.\n",
-                   clients[idx].addr, clients[idx].tmp_user);
+            printf(" Client %s dang nhap: user='%s' luc %s\n",
+                   clients[idx].addr, clients[idx].tmp_user, ts);
         } else {
             clients[idx].login_attempts++;
-            printf("Client %s dang nhap sai (user='%s', lan %d/%d).\n",
+            printf(" Client %s dang nhap sai (user='%s', lan %d/%d).\n",
                    clients[idx].addr, clients[idx].tmp_user,
                    clients[idx].login_attempts, MAX_LOGIN_TRY);
 
@@ -169,7 +189,9 @@ static void handle_client_data(int fd) {
                 remove_client(idx);
             } else {
                 char errmsg[128];
-                snprintf(errmsg, sizeof(errmsg), "\r\nSai ten dang nhap hoac mat khau! Con %d lan thu.\r\nUsername: ", MAX_LOGIN_TRY - clients[idx].login_attempts);
+                snprintf(errmsg, sizeof(errmsg),
+                         "\r\nSai ten dang nhap hoac mat khau! Con %d lan thu.\r\nUsername: ",
+                         MAX_LOGIN_TRY - clients[idx].login_attempts);
                 send_str(fd, errmsg);
                 clients[idx].state       = STATE_WAIT_USER;
                 clients[idx].tmp_user[0] = '\0';
@@ -188,7 +210,7 @@ static void handle_client_data(int fd) {
         if (strncmp(buf, "rm ",  3) == 0 ||
             strncmp(buf, "dd ",  3) == 0 ||
             strncmp(buf, "mkfs", 4) == 0 ||
-            strstr(buf, "> /") != NULL) {
+            strstr(buf, "> /")  != NULL) {
             send_str(fd, "[Lenh bi tu choi vi ly do bao mat]\r\n$ ");
             return;
         }
@@ -200,6 +222,7 @@ static void handle_client_data(int fd) {
 int main(int argc, char *argv[]) {
     if (argc < 3) {
         fprintf(stderr, "Usage: %s <port> <userdb_file>\n", argv[0]);
+        fprintf(stderr, "Vi du: %s 2323 users.txt\n", argv[0]);
         exit(EXIT_FAILURE);
     }
 
@@ -208,7 +231,7 @@ int main(int argc, char *argv[]) {
 
     FILE *test = fopen(g_userdb, "r");
     if (!test) {
-        fprintf(stderr, "Khong mo duoc file userdb '%s': %s\n",
+        fprintf(stderr, " Khong mo duoc file '%s': %s\n",
                 g_userdb, strerror(errno));
         exit(EXIT_FAILURE);
     }
@@ -233,8 +256,9 @@ int main(int argc, char *argv[]) {
         perror("listen"); exit(EXIT_FAILURE);
     }
 
-    printf("Telnet Server lang nghe tren port %d\n", port);
-    printf("Co so du lieu nguoi dung: %s\n\n", g_userdb);
+    printf(" Telnet Server lang nghe port: %d\n", port);
+    printf(" File database : %s\n", g_userdb);
+    printf(" File log      : %s\n", CMD_RESULT_FILE);
 
     while (1) {
         fd_set read_fds;
@@ -269,7 +293,7 @@ int main(int argc, char *argv[]) {
                     send_str(new_fd, "Server day! Thu lai sau.\r\n");
                     close(new_fd);
                 } else {
-                    printf("Ket noi moi tu %s (fd=%d)\n", ip, new_fd);
+                    printf(" Ket noi moi tu %s (fd=%d)\n", ip, new_fd);
                     send_str(new_fd,
                         "Username: ");
                 }
