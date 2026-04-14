@@ -6,13 +6,13 @@
 #include <time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <poll.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
 #define MAX_CLIENTS     32
 #define BUFFER_SIZE     1024
-#define LOG_FILE        "out.txt"
+#define CMD_RESULT_FILE "out.txt"
 #define MAX_LOGIN_TRY   3
 #define BACKLOG         10
 
@@ -28,21 +28,14 @@ typedef struct {
     int  login_attempts;
 } Client;
 
-static Client       clients[MAX_CLIENTS];
-static int          client_count = 0;
-static struct pollfd pfds[MAX_CLIENTS + 1];
-static char         g_userdb[256];
+static Client clients[MAX_CLIENTS];
+static int    client_count = 0;
+static char   g_userdb[256];
 
 static void trim_crlf(char *s) {
     size_t len = strlen(s);
     while (len > 0 && (s[len-1] == '\r' || s[len-1] == '\n' || s[len-1] == ' '))
         s[--len] = '\0';
-}
-
-static void get_timestamp(char *buf, size_t len) {
-    time_t now = time(NULL);
-    struct tm *t = localtime(&now);
-    strftime(buf, len, "%Y/%m/%d %H:%M:%S", t);
 }
 
 static void send_str(int fd, const char *msg) {
@@ -55,17 +48,8 @@ static int find_client(int fd) {
     return -1;
 }
 
-static void rebuild_pfds(int server_fd) {
-    pfds[0].fd     = server_fd;
-    pfds[0].events = POLLIN;
-    for (int i = 0; i < client_count; i++) {
-        pfds[i + 1].fd     = clients[i].fd;
-        pfds[i + 1].events = POLLIN;
-    }
-}
-
 static void remove_client(int idx) {
-    printf("Client %s (fd=%d) ngat ket noi.\n",
+    printf(" Client %s (fd=%d) ngat ket noi.\n",
            clients[idx].addr, clients[idx].fd);
     close(clients[idx].fd);
     clients[idx] = clients[client_count - 1];
@@ -83,37 +67,50 @@ static int add_client(int fd, const char *addr) {
     return 0;
 }
 
-static void log_login(const char *username, const char *addr) {
+static void get_timestamp(char *buf, size_t len) {
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    strftime(buf, len, "%Y/%m/%d %H:%M:%S", t);
+}
+
+static void log_login_success(const char *username, const char *addr) {
     char ts[32];
     get_timestamp(ts, sizeof(ts));
-    FILE *fp = fopen(LOG_FILE, "a");
+
+    FILE *fp = fopen(CMD_RESULT_FILE, "a");
     if (!fp) return;
     fprintf(fp, "[%s] Dang nhap thanh cong: user='%s' tu %s\n", ts, username, addr);
     fclose(fp);
-    printf("[LOG] Ghi %s: user='%s' luc %s\n", LOG_FILE, username, ts);
+
+    printf("[LOG] Ghi out.txt: user='%s' luc %s\n", username, ts);
 }
 
 static int check_credentials(const char *username, const char *password) {
     FILE *fp = fopen(g_userdb, "r");
     if (!fp) return 0;
+
     char line[256];
     while (fgets(line, sizeof(line), fp)) {
         trim_crlf(line);
         if (line[0] == '\0' || line[0] == '#') continue;
+
         char db_user[64] = {0}, db_pass[64] = {0};
         if (sscanf(line, "%63s %63s", db_user, db_pass) < 2) continue;
+
         if (strcmp(db_user, username) == 0 && strcmp(db_pass, password) == 0) {
             fclose(fp);
             return 1;
         }
     }
+
     fclose(fp);
     return 0;
 }
 
 static void execute_command(int fd, const char *cmd) {
-    char shell_cmd[BUFFER_SIZE + 16];
+    char shell_cmd[BUFFER_SIZE + 64];
     snprintf(shell_cmd, sizeof(shell_cmd), "%s 2>&1", cmd);
+
     printf("[CMD] fd=%d: %s\n", fd, shell_cmd);
 
     FILE *fp = popen(shell_cmd, "r");
@@ -124,6 +121,7 @@ static void execute_command(int fd, const char *cmd) {
 
     char buf[BUFFER_SIZE];
     int sent_any = 0;
+
     while (fgets(buf, sizeof(buf), fp)) {
         size_t len = strlen(buf);
         if (len > 0 && buf[len-1] == '\n') {
@@ -137,6 +135,7 @@ static void execute_command(int fd, const char *cmd) {
 
     if (!sent_any)
         send_str(fd, "[Lenh thanh cong, khong co output]\r\n");
+
     send_str(fd, "$ ");
 }
 
@@ -169,21 +168,20 @@ static void handle_client_data(int fd) {
 
             char ts[32];
             get_timestamp(ts, sizeof(ts));
-            log_login(clients[idx].tmp_user, clients[idx].addr);
+            log_login_success(clients[idx].tmp_user, clients[idx].addr);
 
             char welcome[256];
             snprintf(welcome, sizeof(welcome),
                      "\r\nDang nhap thanh cong! Chao mung, %s.\r\n"
-                     "Thoi gian dang nhap: %s\r\n"
-                     "Go lenh de thuc thi. Go 'exit' de thoat.\r\n$ ",
+                     "Thoi gian dang nhap: %s\r\n",
                      clients[idx].tmp_user, ts);
             send_str(fd, welcome);
-            printf("Client %s dang nhap: user='%s' luc %s\n",
+            printf(" Client %s dang nhap: user='%s' luc %s\n",
                    clients[idx].addr, clients[idx].tmp_user, ts);
         } else {
             clients[idx].login_attempts++;
-            printf("Dang nhap sai (user='%s', lan %d/%d).\n",
-                   clients[idx].tmp_user,
+            printf(" Client %s dang nhap sai (user='%s', lan %d/%d).\n",
+                   clients[idx].addr, clients[idx].tmp_user,
                    clients[idx].login_attempts, MAX_LOGIN_TRY);
 
             if (clients[idx].login_attempts >= MAX_LOGIN_TRY) {
@@ -208,6 +206,7 @@ static void handle_client_data(int fd) {
             remove_client(idx);
             return;
         }
+
         if (strncmp(buf, "rm ",  3) == 0 ||
             strncmp(buf, "dd ",  3) == 0 ||
             strncmp(buf, "mkfs", 4) == 0 ||
@@ -215,6 +214,7 @@ static void handle_client_data(int fd) {
             send_str(fd, "[Lenh bi tu choi vi ly do bao mat]\r\n$ ");
             return;
         }
+
         execute_command(fd, buf);
     }
 }
@@ -222,6 +222,7 @@ static void handle_client_data(int fd) {
 int main(int argc, char *argv[]) {
     if (argc < 3) {
         fprintf(stderr, "Usage: %s <port> <userdb_file>\n", argv[0]);
+        fprintf(stderr, "Vi du: %s 2323 users.txt\n", argv[0]);
         exit(EXIT_FAILURE);
     }
 
@@ -230,7 +231,7 @@ int main(int argc, char *argv[]) {
 
     FILE *test = fopen(g_userdb, "r");
     if (!test) {
-        fprintf(stderr, "Khong mo duoc file '%s': %s\n",
+        fprintf(stderr, " Khong mo duoc file '%s': %s\n",
                 g_userdb, strerror(errno));
         exit(EXIT_FAILURE);
     }
@@ -255,21 +256,30 @@ int main(int argc, char *argv[]) {
         perror("listen"); exit(EXIT_FAILURE);
     }
 
-    printf("Port: %d\n", port);
-    printf("File database : %s\n", g_userdb);
-    printf("File log      : %s\n", LOG_FILE);
+    printf(" Telnet Server lang nghe port: %d\n", port);
+    printf(" File database : %s\n", g_userdb);
+    printf(" File log      : %s\n", CMD_RESULT_FILE);
 
     while (1) {
-        rebuild_pfds(server_fd);
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(server_fd, &read_fds);
+        int max_fd = server_fd;
 
-        int activity = poll(pfds, client_count + 1, -1);
+        for (int i = 0; i < client_count; i++) {
+            FD_SET(clients[i].fd, &read_fds);
+            if (clients[i].fd > max_fd)
+                max_fd = clients[i].fd;
+        }
+
+        int activity = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
         if (activity < 0) {
             if (errno == EINTR) continue;
-            perror("poll");
+            perror("select");
             break;
         }
 
-        if (pfds[0].revents & POLLIN) {
+        if (FD_ISSET(server_fd, &read_fds)) {
             struct sockaddr_in cli_addr;
             socklen_t addrlen = sizeof(cli_addr);
             int new_fd = accept(server_fd, (struct sockaddr *)&cli_addr, &addrlen);
@@ -278,12 +288,14 @@ int main(int argc, char *argv[]) {
             } else {
                 char ip[INET_ADDRSTRLEN];
                 inet_ntop(AF_INET, &cli_addr.sin_addr, ip, sizeof(ip));
+
                 if (add_client(new_fd, ip) < 0) {
                     send_str(new_fd, "Server day! Thu lai sau.\r\n");
                     close(new_fd);
                 } else {
-                    printf("Ket noi moi tu %s (fd=%d)\n", ip, new_fd);
-                    send_str(new_fd, "Username: ");
+                    printf(" Ket noi moi tu %s (fd=%d)\n", ip, new_fd);
+                    send_str(new_fd,
+                        "Username: ");
                 }
             }
         }
@@ -294,8 +306,9 @@ int main(int argc, char *argv[]) {
             snap_fds[i] = clients[i].fd;
 
         for (int i = 0; i < snap_cnt; i++) {
-            if (pfds[i + 1].revents & POLLIN && find_client(snap_fds[i]) >= 0)
-                handle_client_data(snap_fds[i]);
+            int fd = snap_fds[i];
+            if (FD_ISSET(fd, &read_fds) && find_client(fd) >= 0)
+                handle_client_data(fd);
         }
     }
 
