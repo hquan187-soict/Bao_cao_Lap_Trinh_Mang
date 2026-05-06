@@ -1,0 +1,4 @@
+admin admin
+guest nopass
+quanhoang 123456
+testuser password
