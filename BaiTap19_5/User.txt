@@ -1,0 +1,5 @@
+admin admin
+guest 1111
+user1 pass1
+Quanhoang 111
+soict hust

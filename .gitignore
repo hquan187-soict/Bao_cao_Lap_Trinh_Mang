@@ -1,0 +1,12 @@
+# 1. Chặn thư mục build
+*
+
+!*/
+
+!*.c
+!*.h
+!*.txt
+!.gitignore
+
+.DS_Store
+*/.DS_Store
